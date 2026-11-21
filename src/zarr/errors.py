@@ -6,6 +6,7 @@ __all__ = [
     "ContainsArrayAndGroupError",
     "ContainsArrayError",
     "ContainsGroupError",
+    "CopyError",
     "GroupNotFoundError",
     "MetadataValidationError",
     "NegativeStepError",
@@ -15,6 +16,7 @@ __all__ = [
     "ZarrDeprecationWarning",
     "ZarrFutureWarning",
     "ZarrRuntimeWarning",
+    "ZarrUserWarning",
 ]
 
 
@@ -81,6 +83,13 @@ class ContainsArrayAndGroupError(BaseZarrError):
         "Only one of these files may be present in a given directory / prefix. "
         "Remove the .zarray file, or the .zgroup file, or both."
     )
+
+
+class CopyError(BaseZarrError):
+    """
+    Raised when a copy operation cannot be completed, for example because a node with the same
+    name already exists at the destination and ``if_exists='raise'`` is set (the default).
+    """
 
 
 class MetadataValidationError(BaseZarrError):

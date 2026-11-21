@@ -114,25 +114,169 @@ def consolidate_metadata(
     return Group(sync(async_api.consolidate_metadata(store, path=path, zarr_format=zarr_format)))
 
 
-def copy(*args: Any, **kwargs: Any) -> tuple[int, int, int]:
+def copy(
+    source: Group,
+    dest: Group,
+    *,
+    if_exists: Literal["raise", "skip"] = "raise",
+    dry_run: bool = False,
+) -> tuple[int, int, int]:
     """
-    Not implemented.
+    Copy the contents of one Zarr group into another group.
+
+    The source group may be located at the root of a store or in a nested directory; the
+    destination must be an already existing group. After the copy, the destination contains
+    the same sub-groups, arrays, attributes, shapes, chunk shapes, data types and fill values
+    as the source. Zarr format 2 and format 3 groups keep their respective storage layouts,
+    and only chunks that were written in the source are copied, so unwritten regions remain
+    sparse in the destination.
+
+    Only the contents of the source group are copied: sibling groups elsewhere in the source
+    store are left untouched, and existing content of the destination outside of copied node
+    names is preserved.
+
+    Parameters
+    ----------
+    source : AsyncGroup
+        The group to copy.
+    dest : AsyncGroup
+        An existing group to copy into.
+    if_exists : {"raise", "skip"}, default "raise"
+        What to do when a node with the same name as a source node already exists in the
+        destination group.
+
+        - ``"raise"`` (the default): raise a
+          [`CopyError`][zarr.errors.CopyError] before writing anything.
+        - ``"skip"``: leave the existing destination node, including all of its contents,
+          untouched and copy every other branch normally. All arrays nested below a skipped
+          group are counted as skipped.
+    dry_run : bool, default False
+        If True, inspect the source and destination and report conflicts and the work that
+        would be performed, but do not write anything to the destination. The number of bytes
+        copied is always zero for a dry run.
+
+    Returns
+    -------
+    tuple of int
+        A tuple of ``(n_copied, n_skipped, n_bytes_copied)``: the number of arrays that were
+        copied, the number of arrays that were skipped because of a name conflict, and the
+        total number of data bytes that were copied. In a dry run the third value is zero.
+
+    Raises
+    ------
+    CopyError
+        If a name conflict is encountered with ``if_exists="raise"``, or if the source and
+        destination overlap within the same store.
+    TypeError
+        If the stores are not in-memory or local directory stores, or if the store types or
+        Zarr formats do not match.
+    ValueError
+        If ``if_exists`` is not one of ``"raise"`` or ``"skip"``, or the Zarr formats of the
+        source and destination groups differ.
+
+    See Also
+    --------
+    copy_all, copy_store
     """
-    return sync(async_api.copy(*args, **kwargs))
+    return sync(
+        async_api.copy(
+            source._async_group,
+            dest._async_group,
+            if_exists=if_exists,
+            dry_run=dry_run,
+        )
+    )
 
 
-def copy_all(*args: Any, **kwargs: Any) -> tuple[int, int, int]:
+def copy_all(
+    source: Group,
+    dest: Group,
+    *,
+    if_exists: Literal["raise", "skip"] = "raise",
+    dry_run: bool = False,
+) -> tuple[int, int, int]:
     """
-    Not implemented.
+    Copy the full contents of a group into another group.
+
+    This is an alias for [`copy`][zarr.api.asynchronous.copy]: the whole hierarchy below the
+    source group, including sub-groups, arrays, attributes and written chunk data, is copied
+    into the destination group.
+
+    Parameters
+    ----------
+    source : AsyncGroup
+        The group to copy.
+    dest : AsyncGroup
+        An existing group to copy into.
+    if_exists : {"raise", "skip"}, default "raise"
+        See [`copy`][zarr.api.asynchronous.copy].
+    dry_run : bool, default False
+        See [`copy`][zarr.api.asynchronous.copy].
+
+    Returns
+    -------
+    tuple of int
+        See [`copy`][zarr.api.asynchronous.copy].
     """
-    return sync(async_api.copy_all(*args, **kwargs))
+    return sync(
+        async_api.copy_all(
+            source._async_group,
+            dest._async_group,
+            if_exists=if_exists,
+            dry_run=dry_run,
+        )
+    )
 
 
-def copy_store(*args: Any, **kwargs: Any) -> tuple[int, int, int]:
+def copy_store(
+    source: StoreLike,
+    dest: StoreLike,
+    *,
+    source_path: str | None = None,
+    dest_path: str | None = None,
+    if_exists: Literal["raise", "skip"] = "raise",
+    dry_run: bool = False,
+) -> tuple[int, int, int]:
     """
-    Not implemented.
+    Copy a group from one store into a group in another store (or another location in a
+    store).
+
+    This is a store-oriented wrapper around [`copy`][zarr.api.asynchronous.copy]: the source
+    group is opened from ``source`` at ``source_path`` and the destination group is opened
+    from ``dest`` at ``dest_path``. The destination group must already exist. Only in-memory
+    and local directory stores of the same type and Zarr format are supported.
+
+    Parameters
+    ----------
+    source : StoreLike
+        The store-like object containing the source group. See the
+        [storage documentation in the user guide][user-guide-store-like] for valid values.
+    dest : StoreLike
+        The store-like object containing the already existing destination group.
+    source_path : str or None, optional
+        The path to the source group within ``source``. If None, the store root is used.
+    dest_path : str or None, optional
+        The path to the destination group within ``dest``. If None, the store root is used.
+    if_exists : {"raise", "skip"}, default "raise"
+        See [`copy`][zarr.api.asynchronous.copy].
+    dry_run : bool, default False
+        See [`copy`][zarr.api.asynchronous.copy].
+
+    Returns
+    -------
+    tuple of int
+        See [`copy`][zarr.api.asynchronous.copy].
     """
-    return sync(async_api.copy_store(*args, **kwargs))
+    return sync(
+        async_api.copy_store(
+            source,
+            dest,
+            source_path=source_path,
+            dest_path=dest_path,
+            if_exists=if_exists,
+            dry_run=dry_run,
+        )
+    )
 
 
 def load(
