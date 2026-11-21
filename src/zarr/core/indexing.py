@@ -991,18 +991,13 @@ class OIndex:
         # if input is a Zarr array, we materialize it now.
         if isinstance(selection, Array):
             selection = _zarr_array_to_int_or_bool_array(selection)
-
-        fields, new_selection = pop_fields(selection)
-        new_selection = ensure_tuple(new_selection)
-        new_selection = replace_lists(new_selection)
+        fields, new_selection = _normalize_index_selection(selection)
         return self.array.get_orthogonal_selection(
             cast("OrthogonalSelection", new_selection), fields=fields
         )
 
     def __setitem__(self, selection: OrthogonalSelection, value: npt.ArrayLike) -> None:
-        fields, new_selection = pop_fields(selection)
-        new_selection = ensure_tuple(new_selection)
-        new_selection = replace_lists(new_selection)
+        fields, new_selection = _normalize_index_selection(selection)
         return self.array.set_orthogonal_selection(
             cast("OrthogonalSelection", new_selection), value, fields=fields
         )
@@ -1018,13 +1013,24 @@ class AsyncOIndex(Generic[T_ArrayMetadata]):
         # if input is a Zarr array, we materialize it now.
         if isinstance(selection, Array):
             selection = _zarr_array_to_int_or_bool_array(selection)
-
-        fields, new_selection = pop_fields(selection)
-        new_selection = ensure_tuple(new_selection)
-        new_selection = replace_lists(new_selection)
+        fields, new_selection = _normalize_index_selection(selection)
         return await self.array.get_orthogonal_selection(
             cast(OrthogonalSelection, new_selection), fields=fields
         )
+
+
+def _normalize_index_selection(selection: SelectionWithFields) -> tuple[Fields | None, Selection]:
+    """Split field names from the selection, wrap bare selections in a tuple and
+    convert lists to arrays.
+
+    This is the common preparation step shared by the synchronous and
+    asynchronous read entries and the synchronous write entries of the
+    orthogonal and vectorized indexing helpers.
+    """
+    fields, new_selection = pop_fields(selection)
+    new_selection = ensure_tuple(new_selection)
+    new_selection = replace_lists(new_selection)
+    return fields, new_selection
 
 
 @dataclass(frozen=True)
@@ -1115,15 +1121,11 @@ class BlockIndex:
     array: AnyArray
 
     def __getitem__(self, selection: BasicSelection) -> NDArrayLikeOrScalar:
-        fields, new_selection = pop_fields(selection)
-        new_selection = ensure_tuple(new_selection)
-        new_selection = replace_lists(new_selection)
+        fields, new_selection = _normalize_index_selection(selection)
         return self.array.get_block_selection(cast("BasicSelection", new_selection), fields=fields)
 
     def __setitem__(self, selection: BasicSelection, value: npt.ArrayLike) -> None:
-        fields, new_selection = pop_fields(selection)
-        new_selection = ensure_tuple(new_selection)
-        new_selection = replace_lists(new_selection)
+        fields, new_selection = _normalize_index_selection(selection)
         return self.array.set_block_selection(
             cast("BasicSelection", new_selection), value, fields=fields
         )
@@ -1301,6 +1303,54 @@ class MaskIndexer(CoordinateIndexer):
         super().__init__(selection_indices, shape, chunk_grid)
 
 
+class SelectionKind(Enum):
+    """The kind of a normalized vectorized selection."""
+
+    COORDINATE = 1
+    MASK = 2
+
+
+def _vindex_invalid_selection_error(selection: Any) -> VindexInvalidSelectionError:
+    return VindexInvalidSelectionError(
+        "unsupported selection type for vectorized indexing; only "
+        "coordinate selection (tuple of integer arrays) and mask selection "
+        f"(single Boolean array) are supported; got {selection!r}"
+    )
+
+
+def _prepare_vindex_selection(
+    selection: CoordinateSelection | MaskSelection | AnyArray,
+) -> tuple[Fields | None, Selection]:
+    """Preparation for the vectorized (inner) indexing read entries.
+
+    Materializes a Zarr array used as an index and then applies the common
+    selection normalization. Used by both the synchronous and asynchronous
+    vectorized indexing read entries.
+    """
+    from zarr.core.array import Array
+
+    # if input is a Zarr array, we materialize it now.
+    if isinstance(selection, Array):
+        selection = _zarr_array_to_int_or_bool_array(selection)
+    return _normalize_index_selection(selection)
+
+
+def _classify_vindex_selection(
+    selection: Selection, shape: tuple[int, ...]
+) -> SelectionKind:
+    """Classify a normalized selection as coordinate or mask selection.
+
+    Raises ``VindexInvalidSelectionError`` for anything else. The same rules are
+    applied by the synchronous and asynchronous vectorized indexing entries.
+    """
+    if is_coordinate_selection(selection, shape):
+        return SelectionKind.COORDINATE
+    elif is_mask_selection(selection, shape):
+        return SelectionKind.MASK
+    else:
+        raise _vindex_invalid_selection_error(selection)
+
+
 @dataclass(frozen=True)
 class VIndex:
     array: AnyArray
@@ -1309,43 +1359,23 @@ class VIndex:
     def __getitem__(
         self, selection: CoordinateSelection | MaskSelection | AnyArray
     ) -> NDArrayLikeOrScalar:
-        from zarr.core.array import Array
-
-        # if input is a Zarr array, we materialize it now.
-        if isinstance(selection, Array):
-            selection = _zarr_array_to_int_or_bool_array(selection)
-        fields, new_selection = pop_fields(selection)
-        new_selection = ensure_tuple(new_selection)
-        new_selection = replace_lists(new_selection)
-        if is_coordinate_selection(new_selection, self.array.shape):
+        fields, new_selection = _prepare_vindex_selection(selection)
+        selection_kind = _classify_vindex_selection(new_selection, self.array.shape)
+        if selection_kind is SelectionKind.COORDINATE:
             return self.array.get_coordinate_selection(new_selection, fields=fields)
-        elif is_mask_selection(new_selection, self.array.shape):
-            return self.array.get_mask_selection(new_selection, fields=fields)
         else:
-            msg = (
-                "unsupported selection type for vectorized indexing; only "
-                "coordinate selection (tuple of integer arrays) and mask selection "
-                f"(single Boolean array) are supported; got {new_selection!r}"
-            )
-            raise VindexInvalidSelectionError(msg)
+            return self.array.get_mask_selection(new_selection, fields=fields)
 
     def __setitem__(
         self, selection: CoordinateSelection | MaskSelection, value: npt.ArrayLike
     ) -> None:
-        fields, new_selection = pop_fields(selection)
-        new_selection = ensure_tuple(new_selection)
-        new_selection = replace_lists(new_selection)
-        if is_coordinate_selection(new_selection, self.array.shape):
+        # write entries do not materialize Zarr array indices; only read entries do
+        fields, new_selection = _normalize_index_selection(selection)
+        selection_kind = _classify_vindex_selection(new_selection, self.array.shape)
+        if selection_kind is SelectionKind.COORDINATE:
             self.array.set_coordinate_selection(new_selection, value, fields=fields)
-        elif is_mask_selection(new_selection, self.array.shape):
-            self.array.set_mask_selection(new_selection, value, fields=fields)
         else:
-            msg = (
-                "unsupported selection type for vectorized indexing; only "
-                "coordinate selection (tuple of integer arrays) and mask selection "
-                f"(single Boolean array) are supported; got {new_selection!r}"
-            )
-            raise VindexInvalidSelectionError(msg)
+            self.array.set_mask_selection(new_selection, value, fields=fields)
 
 
 @dataclass(frozen=True)
@@ -1356,27 +1386,12 @@ class AsyncVIndex(Generic[T_ArrayMetadata]):
     async def getitem(
         self, selection: CoordinateSelection | MaskSelection | AnyArray
     ) -> NDArrayLikeOrScalar:
-        # TODO deduplicate these internals with the sync version of getitem
-        # TODO requires solving this circular sync issue: https://github.com/zarr-developers/zarr-python/pull/3083#discussion_r2230737448
-        from zarr.core.array import Array
-
-        # if input is a Zarr array, we materialize it now.
-        if isinstance(selection, Array):
-            selection = _zarr_array_to_int_or_bool_array(selection)
-        fields, new_selection = pop_fields(selection)
-        new_selection = ensure_tuple(new_selection)
-        new_selection = replace_lists(new_selection)
-        if is_coordinate_selection(new_selection, self.array.shape):
+        fields, new_selection = _prepare_vindex_selection(selection)
+        selection_kind = _classify_vindex_selection(new_selection, self.array.shape)
+        if selection_kind is SelectionKind.COORDINATE:
             return await self.array.get_coordinate_selection(new_selection, fields=fields)
-        elif is_mask_selection(new_selection, self.array.shape):
-            return await self.array.get_mask_selection(new_selection, fields=fields)
         else:
-            msg = (
-                "unsupported selection type for vectorized indexing; only "
-                "coordinate selection (tuple of integer arrays) and mask selection "
-                f"(single Boolean array) are supported; got {new_selection!r}"
-            )
-            raise VindexInvalidSelectionError(msg)
+            return await self.array.get_mask_selection(new_selection, fields=fields)
 
 
 def check_fields(fields: Fields | None, dtype: np.dtype[Any]) -> np.dtype[Any]:
@@ -1578,18 +1593,43 @@ def get_indexer(
     if is_pure_fancy_indexing(pure_selection, len(shape)):
         new_selection = ensure_tuple(selection)
         new_selection = replace_lists(new_selection)
-        if is_coordinate_selection(new_selection, shape):
+        selection_kind = _classify_vindex_selection(new_selection, shape)
+        if selection_kind is SelectionKind.COORDINATE:
             return CoordinateIndexer(cast("CoordinateSelection", selection), shape, chunk_grid)
-        elif is_mask_selection(new_selection, shape):
-            return MaskIndexer(cast("MaskSelection", selection), shape, chunk_grid)
         else:
-            msg = (
-                "unsupported selection type for vectorized indexing; only "
-                "coordinate selection (tuple of integer arrays) and mask selection "
-                f"(single Boolean array) are supported; got {new_selection!r}"
-            )
-            raise VindexInvalidSelectionError(msg)
+            return MaskIndexer(cast("MaskSelection", selection), shape, chunk_grid)
     elif is_pure_orthogonal_indexing(pure_selection, len(shape)):
         return OrthogonalIndexer(cast("OrthogonalSelection", selection), shape, chunk_grid)
     else:
         return BasicIndexer(cast("BasicSelection", selection), shape, chunk_grid)
+
+
+IndexerKind: TypeAlias = Literal["basic", "orthogonal", "block", "coordinate", "mask"]
+
+
+def build_indexer(
+    kind: IndexerKind,
+    selection: Any,
+    shape: tuple[int, ...],
+    chunk_grid: ChunkGrid,
+) -> Indexer:
+    """Build the indexer for an explicitly selected indexing mode.
+
+    The indexer construction rules live here once; both the synchronous
+    ``Array`` selection methods and the asynchronous module-level selection
+    functions call this factory instead of instantiating indexer classes
+    themselves.
+    """
+    if kind == "basic":
+        return BasicIndexer(cast("BasicSelection", selection), shape, chunk_grid)
+    elif kind == "orthogonal":
+        return OrthogonalIndexer(cast("OrthogonalSelection", selection), shape, chunk_grid)
+    elif kind == "block":
+        return BlockIndexer(cast("BasicSelection", selection), shape, chunk_grid)
+    elif kind == "coordinate":
+        return CoordinateIndexer(cast("CoordinateSelection", selection), shape, chunk_grid)
+    elif kind == "mask":
+        return MaskIndexer(cast("MaskSelection", selection), shape, chunk_grid)
+    else:  # pragma: no cover
+        msg = f"Unknown indexer kind: {kind!r}"
+        raise ValueError(msg)

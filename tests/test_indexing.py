@@ -28,6 +28,7 @@ from zarr.core.indexing import (
     oindex_set,
     replace_ellipsis,
 )
+from zarr.core.sync import sync
 from zarr.registry import get_ndbuffer_class
 from zarr.storage import MemoryStore, StorePath
 
@@ -1947,6 +1948,58 @@ def test_indexing_with_zarr_array(store: StorePath) -> None:
 
     assert_array_equal(a[ii], za[zii])
     assert_array_equal(a[ii], za.oindex[zii])
+
+
+def test_async_indexing_with_zarr_array(store: StorePath) -> None:
+    # the asynchronous read entries must accept Zarr arrays as indices and
+    # materialize them without a synchronous wait on the target array
+    a = np.arange(10)
+    za = zarr.array(a, chunks=2, store=store / "a")
+    ix = [False, True, False, True, False, True, False, True, False, True]
+    ii = [0, 2, 4, 5]
+
+    zix = zarr.array(ix, chunks=2, store=store, dtype="bool", path="ix")
+    zii = zarr.array(ii, chunks=2, store=store, dtype="i4", path="ii")
+
+    async_za = za.async_array
+    assert_array_equal(a[ix], sync(async_za.vindex.getitem(zix)))
+    assert_array_equal(a[ix], sync(async_za.oindex.getitem(zix)))
+    assert_array_equal(a[ii], sync(async_za.oindex.getitem(zii)))
+
+    # invalid index dtype keeps raising an IndexError
+    zf = zarr.array([0.1, 0.2], chunks=2, store=store, dtype="f8", path="zf")
+    with pytest.raises(IndexError):
+        sync(async_za.vindex.getitem(zf))
+    with pytest.raises(IndexError):
+        sync(async_za.oindex.getitem(zf))
+
+
+def test_vindex_invalid_selection_error_sync_and_async(store: StorePath) -> None:
+    # coordinate/mask classification and the resulting error kind and message
+    # must be identical between the synchronous and asynchronous entries
+    from zarr.errors import VindexInvalidSelectionError
+
+    za = zarr.array(np.arange(9).reshape(3, 3), chunks=(2, 2), store=store)
+    bad_selection = "invalid_indexer"
+    match = "unsupported selection type for vectorized indexing"
+
+    with pytest.raises(VindexInvalidSelectionError, match=match):
+        za.vindex[bad_selection]  # type: ignore[index]
+    with pytest.raises(VindexInvalidSelectionError, match=match):
+        sync(za.async_array.vindex.getitem(bad_selection))  # type: ignore[arg-type]
+
+
+def test_orthogonal_selection_is_not_coordinate_selection(store: StorePath) -> None:
+    # per-axis (orthogonal) indexing must keep going through the orthogonal
+    # path instead of being treated as point (coordinate) indexing
+    a = np.arange(9).reshape(3, 3)
+    za = zarr_array_from_numpy_array(store, a)
+
+    selection = ([0, 2], slice(None))
+    expected = a[[0, 2], :]
+    assert_array_equal(expected, za[selection])
+    assert_array_equal(expected, za.oindex[selection])
+    assert_array_equal(expected, sync(za.async_array.oindex.getitem(selection)))
 
 
 @pytest.mark.parametrize("store", ["local", "memory"], indirect=["store"])

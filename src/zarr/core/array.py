@@ -79,20 +79,17 @@ from zarr.core.indexing import (
     BasicIndexer,
     BasicSelection,
     BlockIndex,
-    BlockIndexer,
-    CoordinateIndexer,
     CoordinateSelection,
     Fields,
     Indexer,
-    MaskIndexer,
     MaskSelection,
     OIndex,
-    OrthogonalIndexer,
     OrthogonalSelection,
     Selection,
     VIndex,
     _iter_grid,
     _iter_regions,
+    build_indexer,
     check_fields,
     check_no_multi_fields,
     is_pure_fancy_indexing,
@@ -143,6 +140,7 @@ if TYPE_CHECKING:
     from zarr.abc.store import Store
     from zarr.codecs.sharding import ShardingCodecIndexLocation
     from zarr.core.dtype.wrapper import TBaseDType, TBaseScalar
+    from zarr.core.indexing import CoordinateIndexer
     from zarr.storage import StoreLike
     from zarr.types import AnyArray, AnyAsyncArray, ArrayV2, ArrayV3, AsyncArrayV2, AsyncArrayV3
 
@@ -3062,9 +3060,10 @@ class Array(Generic[T_ArrayMetadata]):
 
         if prototype is None:
             prototype = default_buffer_prototype()
+        indexer = build_indexer("basic", selection, self.shape, self.metadata.chunk_grid)
         return sync(
             self.async_array._get_selection(
-                BasicIndexer(selection, self.shape, self.metadata.chunk_grid),
+                indexer,
                 out=out,
                 fields=fields,
                 prototype=prototype,
@@ -3171,7 +3170,7 @@ class Array(Generic[T_ArrayMetadata]):
         """
         if prototype is None:
             prototype = default_buffer_prototype()
-        indexer = BasicIndexer(selection, self.shape, self.metadata.chunk_grid)
+        indexer = build_indexer("basic", selection, self.shape, self.metadata.chunk_grid)
         sync(self.async_array._set_selection(indexer, value, fields=fields, prototype=prototype))
 
     def get_orthogonal_selection(
@@ -3299,7 +3298,7 @@ class Array(Generic[T_ArrayMetadata]):
         """
         if prototype is None:
             prototype = default_buffer_prototype()
-        indexer = OrthogonalIndexer(selection, self.shape, self.metadata.chunk_grid)
+        indexer = build_indexer("orthogonal", selection, self.shape, self.metadata.chunk_grid)
         return sync(
             self.async_array._get_selection(
                 indexer=indexer, out=out, fields=fields, prototype=prototype
@@ -3418,7 +3417,7 @@ class Array(Generic[T_ArrayMetadata]):
         """
         if prototype is None:
             prototype = default_buffer_prototype()
-        indexer = OrthogonalIndexer(selection, self.shape, self.metadata.chunk_grid)
+        indexer = build_indexer("orthogonal", selection, self.shape, self.metadata.chunk_grid)
         return sync(
             self.async_array._set_selection(indexer, value, fields=fields, prototype=prototype)
         )
@@ -3506,7 +3505,7 @@ class Array(Generic[T_ArrayMetadata]):
 
         if prototype is None:
             prototype = default_buffer_prototype()
-        indexer = MaskIndexer(mask, self.shape, self.metadata.chunk_grid)
+        indexer = build_indexer("mask", mask, self.shape, self.metadata.chunk_grid)
         return sync(
             self.async_array._get_selection(
                 indexer=indexer, out=out, fields=fields, prototype=prototype
@@ -3596,7 +3595,7 @@ class Array(Generic[T_ArrayMetadata]):
         """
         if prototype is None:
             prototype = default_buffer_prototype()
-        indexer = MaskIndexer(mask, self.shape, self.metadata.chunk_grid)
+        indexer = build_indexer("mask", mask, self.shape, self.metadata.chunk_grid)
         sync(self.async_array._set_selection(indexer, value, fields=fields, prototype=prototype))
 
     def get_coordinate_selection(
@@ -3684,17 +3683,14 @@ class Array(Generic[T_ArrayMetadata]):
         """
         if prototype is None:
             prototype = default_buffer_prototype()
-        indexer = CoordinateIndexer(selection, self.shape, self.metadata.chunk_grid)
+        indexer = build_indexer("coordinate", selection, self.shape, self.metadata.chunk_grid)
         out_array = sync(
             self.async_array._get_selection(
                 indexer=indexer, out=out, fields=fields, prototype=prototype
             )
         )
 
-        if hasattr(out_array, "shape"):
-            # restore shape
-            out_array = np.array(out_array).reshape(indexer.sel_shape)
-        return out_array
+        return _restore_coordinate_selection_shape(out_array, indexer)
 
     def set_coordinate_selection(
         self,
@@ -3777,7 +3773,10 @@ class Array(Generic[T_ArrayMetadata]):
         if prototype is None:
             prototype = default_buffer_prototype()
         # setup indexer
-        indexer = CoordinateIndexer(selection, self.shape, self.metadata.chunk_grid)
+        indexer = cast(
+            "CoordinateIndexer",
+            build_indexer("coordinate", selection, self.shape, self.metadata.chunk_grid),
+        )
 
         # handle value - need ndarray-like flatten value
         if not is_scalar(value, self.dtype):
@@ -3899,7 +3898,7 @@ class Array(Generic[T_ArrayMetadata]):
         """
         if prototype is None:
             prototype = default_buffer_prototype()
-        indexer = BlockIndexer(selection, self.shape, self.metadata.chunk_grid)
+        indexer = build_indexer("block", selection, self.shape, self.metadata.chunk_grid)
         return sync(
             self.async_array._get_selection(
                 indexer=indexer, out=out, fields=fields, prototype=prototype
@@ -4000,7 +3999,7 @@ class Array(Generic[T_ArrayMetadata]):
         """
         if prototype is None:
             prototype = default_buffer_prototype()
-        indexer = BlockIndexer(selection, self.shape, self.metadata.chunk_grid)
+        indexer = build_indexer("block", selection, self.shape, self.metadata.chunk_grid)
         sync(self.async_array._set_selection(indexer, value, fields=fields, prototype=prototype))
 
     @property
@@ -5666,7 +5665,8 @@ async def _getitem(
     """
     if prototype is None:
         prototype = default_buffer_prototype()
-    indexer = BasicIndexer(
+    indexer = build_indexer(
+        "basic",
         selection,
         shape=metadata.shape,
         chunk_grid=metadata.chunk_grid,
@@ -5716,7 +5716,7 @@ async def _get_orthogonal_selection(
     """
     if prototype is None:
         prototype = default_buffer_prototype()
-    indexer = OrthogonalIndexer(selection, metadata.shape, metadata.chunk_grid)
+    indexer = build_indexer("orthogonal", selection, metadata.shape, metadata.chunk_grid)
     return await _get_selection(
         store_path,
         metadata,
@@ -5769,7 +5769,7 @@ async def _get_mask_selection(
     """
     if prototype is None:
         prototype = default_buffer_prototype()
-    indexer = MaskIndexer(mask, metadata.shape, metadata.chunk_grid)
+    indexer = build_indexer("mask", mask, metadata.shape, metadata.chunk_grid)
     return await _get_selection(
         store_path,
         metadata,
@@ -5822,7 +5822,7 @@ async def _get_coordinate_selection(
     """
     if prototype is None:
         prototype = default_buffer_prototype()
-    indexer = CoordinateIndexer(selection, metadata.shape, metadata.chunk_grid)
+    indexer = build_indexer("coordinate", selection, metadata.shape, metadata.chunk_grid)
     out_array = await _get_selection(
         store_path,
         metadata,
@@ -5834,10 +5834,7 @@ async def _get_coordinate_selection(
         prototype=prototype,
     )
 
-    if hasattr(out_array, "shape"):
-        # restore shape
-        out_array = np.array(out_array).reshape(indexer.sel_shape)
-    return out_array
+    return _restore_coordinate_selection_shape(out_array, indexer)
 
 
 async def _set_selection(
@@ -5971,7 +5968,8 @@ async def _setitem(
     """
     if prototype is None:
         prototype = default_buffer_prototype()
-    indexer = BasicIndexer(
+    indexer = build_indexer(
+        "basic",
         selection,
         shape=metadata.shape,
         chunk_grid=metadata.chunk_grid,
@@ -5979,6 +5977,20 @@ async def _setitem(
     return await _set_selection(
         store_path, metadata, codec_pipeline, config, indexer, value, prototype=prototype
     )
+
+
+def _restore_coordinate_selection_shape(
+    out_array: NDArrayLikeOrScalar, indexer: Indexer
+) -> NDArrayLikeOrScalar:
+    """Restore the multidimensional shape of a coordinate selection result.
+
+    Coordinate indexers flatten the selection internally; this shared step is
+    used by both the synchronous and asynchronous coordinate read entries.
+    """
+    if hasattr(out_array, "shape"):
+        # restore shape
+        out_array = np.array(out_array).reshape(indexer.sel_shape)  # type: ignore[attr-defined]
+    return out_array
 
 
 async def _resize(
