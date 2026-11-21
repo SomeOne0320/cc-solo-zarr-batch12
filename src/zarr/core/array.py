@@ -131,7 +131,6 @@ from zarr.registry import (
     get_pipeline_class,
 )
 from zarr.storage._common import StorePath, ensure_no_existing_node, make_store_path
-from zarr.storage._utils import _relativize_path
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -4212,12 +4211,119 @@ async def _shards_initialized(
     store_contents = [
         x async for x in array.store_path.store.list_prefix(prefix=array.store_path.path)
     ]
-    store_contents_relative = [
-        _relativize_path(path=key, prefix=array.store_path.path) for key in store_contents
-    ]
+    store_contents_relative = _relativize_keys(store_contents, prefix=array.store_path.path)
+
+    # For the standard chunk key encodings we can decide whether a stored key is a chunk key for
+    # this array by decoding it. This only touches the keys that are actually present in storage,
+    # rather than every chunk coordinate in the (potentially enormous) logical chunk grid.
+    decoded = _decode_stored_chunk_keys(array, store_contents_relative)
+    if decoded is not None:
+        return decoded
+
+    # Fall back to enumerating the chunk grid for chunk key encodings that cannot decode keys,
+    # e.g. custom encodings that only implement `encode_chunk_key`.
+    store_contents_set = set(store_contents_relative)
     return tuple(
-        chunk_key for chunk_key in array._iter_shard_keys() if chunk_key in store_contents_relative
+        chunk_key for chunk_key in array._iter_shard_keys() if chunk_key in store_contents_set
     )
+
+
+def _relativize_keys(store_contents: Iterable[str], *, prefix: str) -> list[str]:
+    """
+    Make store keys relative to an array's path, discarding keys that do not belong to the array.
+
+    Unlike a bare call to ``_relativize_path``, keys that merely share a string prefix with the
+    array path (e.g. the keys of a sibling array called ``foobar`` when this array is ``foo``) are
+    dropped instead of raising an error.
+    """
+    if prefix == "":
+        return list(store_contents)
+    prefix_with_separator = prefix + "/"
+    return [
+        key[len(prefix_with_separator) :]
+        for key in store_contents
+        if key.startswith(prefix_with_separator)
+    ]
+
+
+def _decode_stored_chunk_keys(
+    array: AnyAsyncArray, store_contents_relative: Iterable[str]
+) -> tuple[str, ...] | None:
+    """
+    Identify the stored keys that are chunk keys of ``array`` by decoding them.
+
+    Returns ``None`` when the array's chunk key encoding does not support decoding, in which case
+    callers must fall back to enumerating the chunk grid.
+
+    Only keys produced by this array's chunk key encoding, with the correct number of dimensions
+    and coordinates inside the current chunk (or shard) grid, are accepted.
+    """
+    metadata = array.metadata
+    ndim = len(array.shape)
+
+    if ndim == 0:
+        # There is exactly one possible chunk key for a zero-dimensional array, so no decoding is
+        # necessary. This also avoids the ambiguity of v2's key "0", which decodes to the
+        # one-dimensional coordinate (0,) rather than the zero-dimensional coordinate ().
+        chunk_key = metadata.encode_chunk_key(())
+        return (chunk_key,) if chunk_key in store_contents_relative else ()
+
+    decoder = _get_chunk_key_decoder(array)
+    if decoder is None:
+        return None
+
+    # Probe the decoder on a few coordinates so that a missing or broken decoder - e.g. a custom
+    # encoding that only implements `encode_chunk_key`, or one whose decoding is not the inverse of
+    # its encoding - triggers the fallback path instead of silently producing an incorrect count.
+    probe_coords = [(0,) * ndim, (1,) * ndim, (12,) * ndim]
+    try:
+        for coords in probe_coords:
+            if decoder.decode_chunk_key(metadata.encode_chunk_key(coords)) != coords:
+                return None
+    except Exception:
+        return None
+
+    grid_shape = array._shard_grid_shape
+    # A dict is used to deduplicate keys in case a store yields the same key more than once.
+    initialized: dict[str, None] = {}
+    for key in store_contents_relative:
+        try:
+            coords = decoder.decode_chunk_key(key)
+            if len(coords) != ndim:
+                continue
+            if not all(0 <= coord < bound for coord, bound in zip(coords, grid_shape, strict=True)):
+                # Chunks beyond the current shape, e.g. left over after the array was shrunk.
+                continue
+        except (ValueError, TypeError, IndexError):
+            # Not a chunk key for this array, e.g. array metadata (.zarray/zarr.json), the keys of
+            # a nested node, or a key that a custom decoder returns malformed coordinates for.
+            continue
+        if metadata.encode_chunk_key(coords) != key:
+            # A key that decodes but is not the canonical key this array would write, e.g. a
+            # zero-padded coordinate.
+            continue
+        initialized[key] = None
+
+    return tuple(initialized)
+
+
+def _get_chunk_key_decoder(array: AnyAsyncArray) -> ChunkKeyEncoding | None:
+    """
+    Return the chunk key encoding used to decode stored keys for ``array``, or ``None`` if the
+    encoding cannot be decoded.
+
+    Only the built-in encodings are decoded. Custom encodings are left to the fallback path: even
+    when they implement ``decode_chunk_key``, there is no way to know whether their decoding is
+    actually the inverse of their encoding, and silently miscounting would be worse than the cost
+    of enumerating the grid.
+    """
+    metadata = array.metadata
+    if metadata.zarr_format == 2:
+        return V2ChunkKeyEncoding(separator=metadata.dimension_separator)
+    encoding = metadata.chunk_key_encoding
+    if isinstance(encoding, DefaultChunkKeyEncoding | V2ChunkKeyEncoding):
+        return encoding
+    return None
 
 
 FiltersLike: TypeAlias = (

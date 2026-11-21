@@ -46,8 +46,13 @@ from zarr.core.array import (
 )
 from zarr.core.array_spec import ArrayConfig, ArrayConfigParams
 from zarr.core.buffer import NDArrayLike, NDArrayLikeOrScalar, default_buffer_prototype
-from zarr.core.chunk_grids import _auto_partition
-from zarr.core.chunk_key_encodings import ChunkKeyEncodingParams
+from zarr.core.chunk_grids import RegularChunkGrid, _auto_partition
+from zarr.core.chunk_key_encodings import (
+    ChunkKeyEncoding,
+    ChunkKeyEncodingParams,
+    DefaultChunkKeyEncoding,
+    V2ChunkKeyEncoding,
+)
 from zarr.core.common import JSON, ZarrFormat, ceildiv
 from zarr.core.dtype import (
     DateTime64,
@@ -74,6 +79,7 @@ from zarr.errors import (
     ContainsGroupError,
     ZarrUserWarning,
 )
+from zarr.registry import register_chunk_key_encoding
 from zarr.storage import LocalStore, MemoryStore, StorePath
 from zarr.storage._logging import LoggingStore
 from zarr.types import AnyArray, AnyAsyncArray
@@ -426,6 +432,229 @@ async def test_nchunks_initialized(
             assert observed == await arr.async_array.nchunks_initialized() // chunks_per_shard
         expected = arr._nshards - idx - 1
         assert observed == expected
+
+
+@pytest.mark.parametrize(
+    "chunk_key_encoding",
+    [
+        None,
+        {"name": "default", "configuration": {"separator": "/"}},
+        {"name": "default", "configuration": {"separator": "."}},
+        {"name": "v2", "configuration": {"separator": "/"}},
+        {"name": "v2", "configuration": {"separator": "."}},
+    ],
+)
+@pytest.mark.parametrize("shape", [(10**7,), (10**3, 10**4)])
+def test_nchunks_initialized_sparse_does_not_enumerate_grid(
+    chunk_key_encoding: dict[str, Any] | None,
+    shape: tuple[int, ...],
+) -> None:
+    """
+    Counting initialized chunks in a very large but sparsely populated array must only inspect
+    the keys that are actually present in storage, not enumerate the logical chunk grid.
+    """
+    store = MemoryStore()
+    arr = zarr.create_array(
+        store,
+        shape=shape,
+        chunks=(100,) * len(shape),
+        dtype="i1",
+        zarr_format=3,
+        chunk_key_encoding=chunk_key_encoding,
+    )
+
+    written_coords = [(0,) * len(shape), tuple(s // 100 // 2 for s in shape)]
+    for coords in written_coords:
+        arr[tuple(slice(c * 100, (c + 1) * 100) for c in coords)] = 1
+
+    with (
+        mock.patch.object(
+            RegularChunkGrid, "all_chunk_coords", side_effect=AssertionError("grid enumerated")
+        ),
+        mock.patch.object(
+            zarr.core.array,
+            "_iter_shard_keys",
+            side_effect=AssertionError("chunk keys enumerated"),
+        ),
+    ):
+        assert arr.nchunks_initialized == len(written_coords)
+        assert arr._nshards_initialized == len(written_coords)
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+@pytest.mark.parametrize("separator", [".", "/"])
+def test_nchunks_initialized_separators_and_formats(
+    zarr_format: ZarrFormat, separator: Literal[".", "/"]
+) -> None:
+    """Format 2 and 3 arrays with either dimension separator count written chunks correctly."""
+    store = MemoryStore()
+    if zarr_format == 2:
+        kwargs: dict[str, Any] = {
+            "chunk_key_encoding": {"name": "v2", "configuration": {"separator": separator}}
+        }
+    else:
+        kwargs = {
+            "chunk_key_encoding": {"name": "default", "configuration": {"separator": separator}}
+        }
+    arr = zarr.create_array(
+        store, shape=(100, 100), chunks=(10, 10), dtype="i1", zarr_format=zarr_format, **kwargs
+    )
+    arr[0:10, 0:10] = 1
+    arr[50:60, 50:60] = 2
+    assert arr.nchunks_initialized == 2
+
+    # The key produced by the array's own encoding must be recognized, whatever the separator.
+    sync(store.delete(arr.metadata.encode_chunk_key((0, 0))))
+    assert arr.nchunks_initialized == 1
+
+
+@pytest.mark.parametrize("separator", [".", "/"])
+def test_decode_chunk_key_roundtrip(separator: Literal[".", "/"]) -> None:
+    """Chunk key decoding is the inverse of encoding, for both encodings and both separators."""
+    default = DefaultChunkKeyEncoding(separator=separator)
+    for coords in [(), (0,), (1, 2, 3), (10, 0)]:
+        assert default.decode_chunk_key(default.encode_chunk_key(coords)) == coords
+
+    v2 = V2ChunkKeyEncoding(separator=separator)
+    for coords in [(0,), (1, 2, 3), (10, 0)]:
+        assert v2.decode_chunk_key(v2.encode_chunk_key(coords)) == coords
+
+    # Keys that this encoding would never produce must be rejected rather than decoded to
+    # something plausible.
+    assert default.decode_chunk_key("c") == ()
+    for invalid in [f"c{separator}", "x" + separator + "1", "c" + separator + "a"]:
+        with pytest.raises(ValueError):
+            default.decode_chunk_key(invalid)
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_nchunks_initialized_scalar_and_empty(zarr_format: ZarrFormat) -> None:
+    """Zero-dimensional and empty-dimension arrays keep their existing counts."""
+    store = MemoryStore()
+    scalar = zarr.create_array(store, shape=(), chunks=(), dtype="i1", zarr_format=zarr_format)
+    assert scalar.nchunks == 1
+    assert scalar.nchunks_initialized == 0
+    scalar[()] = 1
+    assert scalar.nchunks_initialized == 1
+    sync(store.delete(scalar.metadata.encode_chunk_key(())))
+    assert scalar.nchunks_initialized == 0
+
+    empty = zarr.create_array(
+        MemoryStore(), shape=(0, 5), chunks=(1, 5), dtype="i1", zarr_format=zarr_format
+    )
+    assert empty.nchunks == 0
+    assert empty.nchunks_initialized == 0
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_nchunks_initialized_nested_array(zarr_format: ZarrFormat) -> None:
+    """Nested arrays count only their own chunks, not those of prefix-similar siblings."""
+    store = MemoryStore()
+    group = zarr.create_group(store, zarr_format=zarr_format)
+    parent = group.create_array("a", shape=(10,), chunks=(1,), dtype="i1")
+    nested = group.create_array("ab", shape=(10,), chunks=(1,), dtype="i1")
+    parent[:] = 1
+    nested[:] = 1
+    assert parent.nchunks_initialized == 10
+    assert nested.nchunks_initialized == 10
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_nchunks_initialized_ignores_neighbor_and_metadata_keys(zarr_format: ZarrFormat) -> None:
+    """
+    Keys from prefix-similar sibling arrays, array metadata, keys outside the current chunk grid
+    and keys that merely look like chunk keys must not be counted.
+    """
+    store = MemoryStore()
+    arr = zarr.create_array(
+        store, name="foo", shape=(10,), chunks=(1,), dtype="i1", zarr_format=zarr_format
+    )
+    neighbor = zarr.create_array(
+        store, name="foobar", shape=(10,), chunks=(1,), dtype="i1", zarr_format=zarr_format
+    )
+    arr[:] = 1
+    neighbor[:] = 1
+
+    prototype = default_buffer_prototype()
+    junk = [
+        "foo/zarr.json",
+        "foo/.zarray",
+        "foo/.zattrs",
+        "foo/c/1/2",
+        "foo/c/1x",
+        "foo/c/-1",
+        "foo/c/+1",
+        "foo/c/ 1",
+        "foo/c/10",
+        "foo/c/01",
+        "foo/0",
+        "foo/01",
+        "foo/10",
+        "foo/-1",
+        "foo/1/2",
+    ]
+    for key in junk:
+        sync(store.set(key, prototype.buffer.from_bytes(b"x")))
+
+    assert arr.nchunks_initialized == 10
+    expected = {arr.metadata.encode_chunk_key((i,)) for i in range(10)}
+    assert set(sync(_shards_initialized(arr.async_array))) == expected
+
+    # Shrinking the array leaves keys behind for chunks beyond the current shape; those must not
+    # be counted.
+    arr.resize(5)
+    assert arr.nchunks_initialized == 5
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_nchunks_initialized_sharded(zarr_format: ZarrFormat) -> None:
+    """Sharded arrays report initialized shards and chunks derived per the chunks-per-shard rule."""
+    if zarr_format == 2:
+        pytest.skip("Zarr format 2 does not support sharding")
+    store = MemoryStore()
+    arr = zarr.create_array(
+        store, shape=(40,), shards=(20,), chunks=(5,), dtype="i1", zarr_format=zarr_format
+    )
+    assert arr._nshards == 2
+    assert arr.nchunks == 8
+    arr[0:20] = 1
+    assert arr._nshards_initialized == 1
+    assert arr.nchunks_initialized == 4
+    arr[20:40] = 1
+    assert arr._nshards_initialized == 2
+    assert arr.nchunks_initialized == 8
+
+
+def test_nchunks_initialized_undecodable_custom_encoding() -> None:
+    """
+    A custom chunk key encoding that cannot decode keys still yields the correct counts via the
+    previous (encode-and-match) approach.
+    """
+    encoding_name = "test-undecodable"
+    separator = "|"
+
+    @dataclasses.dataclass(frozen=True)
+    class UndecodableEncoding(ChunkKeyEncoding):
+        name = encoding_name
+        sep: str = "|"
+
+        def encode_chunk_key(self, chunk_coords: tuple[int, ...]) -> str:
+            return "chunk" + self.sep + self.sep.join(map(str, chunk_coords))
+
+    register_chunk_key_encoding(encoding_name, UndecodableEncoding)
+
+    store = MemoryStore()
+    arr = zarr.create_array(
+        store,
+        shape=(100, 100),
+        chunks=(10, 10),
+        dtype="i1",
+        zarr_format=3,
+        chunk_key_encoding={"name": encoding_name, "configuration": {"sep": separator}},
+    )
+    arr[0:10, 0:10] = 1
+    arr[50:60, 50:60] = 1
+    assert arr.nchunks_initialized == 2
 
 
 @pytest.mark.parametrize("path", ["", "foo"])
