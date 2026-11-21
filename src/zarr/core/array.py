@@ -61,6 +61,7 @@ from zarr.core.common import (
     _warn_order_kwarg,
     ceildiv,
     concurrent_map,
+    normalize_axis,
     parse_shapelike,
     product,
 )
@@ -1825,16 +1826,28 @@ class AsyncArray(Generic[T_ArrayMetadata]):
         data : array-like
             Data to be appended.
         axis : int
-            Axis along which to append.
+            Axis along which to append. Negative values count from the last
+            dimension.
 
         Returns
         -------
         new_shape : tuple
 
+        Raises
+        ------
+        AxisError
+            If ``axis`` is out of bounds for the array's dimensions.
+        ValueError
+            If the dimensions or the non-append axis lengths of ``data`` do not
+            match the array, or if ``data`` cannot be converted to the array's
+            dtype. In these cases the array is not modified.
+
         Notes
         -----
         The size of all dimensions other than `axis` must match between this
-        array and `data`.
+        array and `data`. Input validation happens before the array is resized,
+        so an invalid append leaves the shape and contents of the array
+        unchanged.
         """
         return await _append(self, data, axis)
 
@@ -4075,16 +4088,28 @@ class Array(Generic[T_ArrayMetadata]):
         data : array-like
             Data to be appended.
         axis : int
-            Axis along which to append.
+            Axis along which to append. Negative values count from the last
+            dimension.
 
         Returns
         -------
         new_shape : tuple
 
+        Raises
+        ------
+        AxisError
+            If ``axis`` is out of bounds for the array's dimensions.
+        ValueError
+            If the dimensions or the non-append axis lengths of ``data`` do not
+            match the array, or if ``data`` cannot be converted to the array's
+            dtype. In these cases the array is not modified.
+
         Notes
         -----
         The size of all dimensions other than `axis` must match between this
-        array and `data`.
+        array and `data`. Input validation happens before the array is resized,
+        so an invalid append leaves the shape and contents of the array
+        unchanged.
 
         Examples
         --------
@@ -6052,17 +6077,43 @@ async def _append(
     new_shape : tuple[int, ...]
         The new shape of the array after appending.
 
+    Raises
+    ------
+    AxisError
+        If ``axis`` is out of bounds for the array's dimensions.
+    ValueError
+        If the dimensions or non-append axis lengths of ``data`` are incompatible
+        with the array, or if ``data`` cannot be converted to the array's dtype.
+
     Notes
     -----
     The size of all dimensions other than `axis` must match between the
-    array and `data`.
+    array and `data`. All input validation happens before the array is resized
+    or any metadata is written, so a failed append leaves the array (and the
+    underlying store) unchanged.
     """
-    # ensure data is array-like
-    if not hasattr(data, "shape"):
-        data = np.asanyarray(data)
+    # validate the axis, including negative indices (which are counted from
+    # the last dimension, NumPy-style)
+    axis = normalize_axis(axis, array.ndim)
 
+    # ensure data is array-like. Any object that already has a shape is passed
+    # through as-is so that non-NumPy array-like inputs keep working.
+    np_data: np.ndarray[Any, Any]
+    if hasattr(data, "shape"):
+        np_data = cast("np.ndarray[Any, Any]", data)
+    else:
+        np_data = np.asanyarray(data)
+
+    # the number of dimensions of the new data has to match that of the array
+    if np_data.ndim != array.ndim:
+        raise ValueError(
+            f"number of dimensions of the data to append ({np_data.ndim}) does not match "
+            f"the number of dimensions of the array ({array.ndim})"
+        )
+
+    # validate the shape of the non-append axes before anything is written.
     self_shape_preserved = tuple(s for i, s in enumerate(array.shape) if i != axis)
-    data_shape_preserved = tuple(s for i, s in enumerate(data.shape) if i != axis)
+    data_shape_preserved = tuple(s for i, s in enumerate(np_data.shape) if i != axis)
     if self_shape_preserved != data_shape_preserved:
         raise ValueError(
             f"shape of data to append is not compatible with the array. "
@@ -6071,12 +6122,18 @@ async def _append(
             "All dimensions must match except for the dimension being "
             "appended."
         )
+
+    # convert the input to the array's dtype up front so that invalid input
+    # (e.g. values that cannot be cast to the target dtype) fails before the
+    # array is resized or any metadata is written to the store.
+    np_data = np.asarray(np_data, dtype=array.dtype, order="A")
+
     # remember old shape
     old_shape = array.shape
 
     # determine new shape
     new_shape = tuple(
-        array.shape[i] if i != axis else array.shape[i] + data.shape[i]
+        array.shape[i] if i != axis else array.shape[i] + np_data.shape[i]
         for i in range(len(array.shape))
     )
 
@@ -6094,7 +6151,7 @@ async def _append(
         array.codec_pipeline,
         array.config,
         append_selection,
-        data,
+        np_data,
     )
 
     return new_shape

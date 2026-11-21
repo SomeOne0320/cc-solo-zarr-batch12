@@ -22,6 +22,7 @@ from typing import (
 )
 
 import numpy as np
+from numpy.exceptions import AxisError
 from typing_extensions import ReadOnly
 
 from zarr.core.config import config as zarr_config
@@ -208,6 +209,41 @@ def parse_shapelike(data: ShapeLike) -> tuple[int, ...]:
 
     # cast NumPy scalars to plain python ints
     return tuple(int(x) for x in data_tuple)
+
+
+def normalize_axis(axis: int, ndim: int) -> int:
+    """
+    Normalize an axis argument, resolving negative indices relative to the last dimension
+    (NumPy-style).
+
+    Parameters
+    ----------
+    axis : int
+        The axis to normalize. Negative values count from the last dimension.
+    ndim : int
+        The number of dimensions of the array the axis refers to.
+
+    Returns
+    -------
+    int
+        The normalized, non-negative axis.
+
+    Raises
+    ------
+    AxisError
+        If the axis is out of bounds for an array with ``ndim`` dimensions.
+    TypeError
+        If the axis is not an integer.
+    """
+    if isinstance(axis, bool) or not isinstance(axis, int | np.integer):
+        msg = f"axis must be an integer; got {type(axis).__name__} instead"
+        raise TypeError(msg)
+    axis = int(axis)
+    if axis < 0:
+        axis += ndim
+    if not 0 <= axis < ndim:
+        raise AxisError(axis, ndim)
+    return axis
 
 
 def parse_fill_value(data: Any) -> Any:

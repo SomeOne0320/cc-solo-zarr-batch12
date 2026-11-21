@@ -9,6 +9,7 @@ import pytest
 from zarr.core.common import (
     ANY_ACCESS_MODE,
     AccessModeLiteral,
+    normalize_axis,
     parse_name,
     parse_shapelike,
     product,
@@ -135,3 +136,37 @@ def parse_dtype(data: tuple[str, np.dtype[Any]]) -> None:
 
 # todo: figure out what it means to test this
 def test_parse_fill_value() -> None: ...
+
+
+@pytest.mark.parametrize(
+    ("axis", "ndim", "expected"),
+    [
+        (0, 3, 0),
+        (2, 3, 2),
+        (-1, 3, 2),
+        (-3, 3, 0),
+        (np.int64(-2), 3, 1),
+    ],
+)
+def test_normalize_axis_valid(axis: int, ndim: int, expected: int) -> None:
+    assert normalize_axis(axis, ndim) == expected
+
+
+@pytest.mark.parametrize(
+    ("axis", "ndim"),
+    [(3, 3), (-4, 3), (10, 2), (-1, 0), (0, 0)],
+)
+def test_normalize_axis_out_of_bounds(axis: int, ndim: int) -> None:
+    with pytest.raises(np.exceptions.AxisError):
+        normalize_axis(axis, ndim)
+
+
+@pytest.mark.parametrize("axis", [1.0, "0", None, slice(None)])
+def test_normalize_axis_bad_type(axis: Any) -> None:
+    with pytest.raises(TypeError, match="axis must be an integer"):
+        normalize_axis(axis, 2)
+
+
+def test_normalize_axis_rejects_bool() -> None:
+    with pytest.raises(TypeError, match="axis must be an integer"):
+        normalize_axis(True, 2)

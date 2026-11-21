@@ -931,6 +931,176 @@ def test_append_bad_shape(store: MemoryStore, zarr_format: ZarrFormat) -> None:
         z.append(b)
 
 
+@pytest.mark.parametrize("store", ["local"], indirect=True)
+@pytest.mark.parametrize("zarr_format", [2, 3], indirect=True)
+def test_append_invalid_dtype_atomic_local(store: LocalStore, zarr_format: ZarrFormat) -> None:
+    """
+    Test that input which cannot be cast to the array's dtype is rejected before the
+    array is modified. The in-memory object and a reopened copy must both retain the
+    original shape and contents, and a subsequent valid append must resume at the
+    original end of the array.
+    """
+    data = np.arange(10, dtype="i4")
+    z = zarr.create(shape=data.shape, chunks=5, dtype="i4", store=store, zarr_format=zarr_format)
+    z[:] = data
+
+    # a list with values that cannot be converted to integers
+    with pytest.raises(ValueError, match="invalid literal"):
+        z.append(["a", "b", "c"])
+    assert z.shape == data.shape
+    np.testing.assert_array_equal(z[:], data)
+
+    # an object-dtype numpy array with the same problem
+    with pytest.raises(ValueError, match="invalid literal"):
+        z.append(np.array(["x", "y"], dtype=object))
+    assert z.shape == data.shape
+    np.testing.assert_array_equal(z[:], data)
+
+    # a freshly reopened array must be unchanged too
+    z_reopened = zarr.open_array(store)
+    assert z_reopened.shape == data.shape
+    np.testing.assert_array_equal(z_reopened[:], data)
+
+    # the next valid append starts at the original end
+    more = np.arange(10, 13, dtype="i4")
+    assert z_reopened.append(more) == (13,)
+    np.testing.assert_array_equal(z_reopened[:], np.arange(13, dtype="i4"))
+
+    # reopening again shows the persisted result
+    z_reopened_again = zarr.open_array(store)
+    assert z_reopened_again.shape == (13,)
+    np.testing.assert_array_equal(z_reopened_again[:], np.arange(13, dtype="i4"))
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=True)
+@pytest.mark.parametrize("zarr_format", [2, 3], indirect=True)
+async def test_append_invalid_dtype_atomic_local_async(
+    store: LocalStore, zarr_format: ZarrFormat
+) -> None:
+    """
+    Async counterpart of ``test_append_invalid_dtype_atomic_local``: invalid input must
+    be rejected without modifying the array, for both the live object and a reopened one.
+    """
+    data = np.arange(10, dtype="i4")
+    z = await zarr.api.asynchronous.create(
+        shape=data.shape, chunks=5, dtype="i4", store=store, zarr_format=zarr_format
+    )
+    await z.setitem(slice(None), data)
+
+    with pytest.raises(ValueError, match="invalid literal"):
+        await z.append(["a", "b", "c"])
+    assert z.shape == data.shape
+    np.testing.assert_array_equal(await z.getitem(slice(None)), data)
+
+    with pytest.raises(ValueError, match="invalid literal"):
+        await z.append(np.array(["x", "y"], dtype=object))
+    assert z.shape == data.shape
+
+    z_reopened = await zarr.api.asynchronous.open_array(store=store)
+    assert z_reopened.shape == data.shape
+    np.testing.assert_array_equal(await z_reopened.getitem(slice(None)), data)
+
+    more = np.arange(10, 13, dtype="i4")
+    assert await z_reopened.append(more) == (13,)
+    np.testing.assert_array_equal(await z_reopened.getitem(slice(None)), np.arange(13, dtype="i4"))
+
+
+@pytest.mark.parametrize("store", ["local"], indirect=True)
+@pytest.mark.parametrize("zarr_format", [2, 3], indirect=True)
+def test_append_invalid_dtype_crossing_chunk_boundary(
+    store: LocalStore, zarr_format: ZarrFormat
+) -> None:
+    """
+    Test atomicity of a failed append whose valid region would have crossed the original
+    final chunk boundary: no partial chunks or fill values may remain and the next append
+    must continue from the original end.
+    """
+    z = zarr.create(shape=(5,), chunks=5, dtype="i4", store=store, zarr_format=zarr_format)
+    z[:] = np.arange(5, dtype="i4")
+
+    # this append would extend into a new chunk
+    z.append(np.arange(5, 8, dtype="i4"))
+    np.testing.assert_array_equal(z[:], np.arange(8, dtype="i4"))
+
+    with pytest.raises(ValueError, match="invalid literal"):
+        z.append(["nope"])
+    assert z.shape == (8,)
+    np.testing.assert_array_equal(z[:], np.arange(8, dtype="i4"))
+
+    # the next valid append starts right after index 7, spanning another new chunk
+    z.append(np.arange(8, 12, dtype="i4"))
+    assert z.shape == (12,)
+    np.testing.assert_array_equal(z[:], np.arange(12, dtype="i4"))
+
+    z_reopened = zarr.open_array(store)
+    assert z_reopened.shape == (12,)
+    np.testing.assert_array_equal(z_reopened[:], np.arange(12, dtype="i4"))
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+@pytest.mark.parametrize("zarr_format", [2, 3], indirect=True)
+def test_append_dimension_mismatch(store: MemoryStore, zarr_format: ZarrFormat) -> None:
+    """
+    Test that data with the wrong number of dimensions is rejected before the array
+    is resized.
+    """
+    z = zarr.create(shape=(3, 4), chunks=(2, 2), dtype="i4", store=store, zarr_format=zarr_format)
+    z[:] = np.arange(12, dtype="i4").reshape(3, 4)
+    with pytest.raises(ValueError, match="number of dimensions"):
+        z.append(np.ones(4, dtype="i4"))
+    assert z.shape == (3, 4)
+    np.testing.assert_array_equal(z[:], np.arange(12, dtype="i4").reshape(3, 4))
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+@pytest.mark.parametrize("zarr_format", [2, 3], indirect=True)
+@pytest.mark.parametrize("async_", [False, True])
+async def test_append_axis_validation(
+    store: MemoryStore, zarr_format: ZarrFormat, async_: bool
+) -> None:
+    """
+    Test that the append axis accepts NumPy-style negative indices and raises a clear
+    ``AxisError`` for out-of-bounds values, without modifying the array.
+    """
+    if async_:
+        z = await zarr.api.asynchronous.create(
+            shape=(3, 4), chunks=(2, 2), dtype="i4", store=store, zarr_format=zarr_format
+        )
+        # negative axis is resolved relative to the last dimension
+        assert await z.append(np.ones((3, 1), dtype="i4"), axis=-1) == (3, 5)
+        for bad_axis in (2, -3):
+            with pytest.raises(np.exceptions.AxisError, match="out of bounds"):
+                await z.append(np.ones((1, 5), dtype="i4"), axis=bad_axis)
+        with pytest.raises(TypeError, match="axis must be an integer"):
+            await z.append(np.ones((1, 5), dtype="i4"), axis=1.5)
+        assert z.shape == (3, 5)
+    else:
+        z = zarr.create(
+            shape=(3, 4), chunks=(2, 2), dtype="i4", store=store, zarr_format=zarr_format
+        )
+        assert z.append(np.ones((3, 1), dtype="i4"), axis=-1) == (3, 5)
+        for bad_axis in (2, -3):
+            with pytest.raises(np.exceptions.AxisError, match="out of bounds"):
+                z.append(np.ones((1, 5), dtype="i4"), axis=bad_axis)
+        with pytest.raises(TypeError, match="axis must be an integer"):
+            z.append(np.ones((1, 5), dtype="i4"), axis=1.5)
+        assert z.shape == (3, 5)
+
+
+@pytest.mark.parametrize("store", ["memory"], indirect=True)
+@pytest.mark.parametrize("zarr_format", [2, 3], indirect=True)
+def test_append_valid_dtype_conversions(store: MemoryStore, zarr_format: ZarrFormat) -> None:
+    """
+    Test that the pre-write dtype validation still allows the conversions that append
+    used to accept: lists, floating point values and numeric strings.
+    """
+    z = zarr.create(shape=(2,), chunks=10, dtype="i4", store=store, zarr_format=zarr_format)
+    z.append([1.9, 2.1])
+    z.append(["3", "4"])
+    z.append(np.array([5, 6], dtype="f8"))
+    np.testing.assert_array_equal(z[:], np.array([0, 0, 1, 2, 3, 4, 5, 6], dtype="i4"))
+
+
 @pytest.mark.parametrize("store", ["memory"], indirect=True)
 @pytest.mark.parametrize("write_empty_chunks", [True, False])
 @pytest.mark.parametrize("fill_value", [0, 5])
